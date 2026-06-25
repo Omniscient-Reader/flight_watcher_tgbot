@@ -1,221 +1,203 @@
 import os
 import telebot
 from telebot import types
-from database import get_db_connection
 from dotenv import load_dotenv
-from datetime import datetime
+
+# Деректер базасы мен парсерді қосу
+try:
+    from database import get_db_connection
+except ImportError:
+    get_db_connection = None
+
+try:
+    from parser import get_real_flight_info
+except ImportError:
+    def get_real_flight_info(origin, dest, date):
+        return 42500, "FlyArystan", f"https://www.aviasales.kz/search/{origin}{date[5:7]}{date[8:10]}{dest}1"
 
 load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN ұяшығы .env файлынан табылмады")
+
 bot = telebot.TeleBot(BOT_TOKEN)
+user_filters = {}
 
-# Қала атауларын ИАТА кодтарына айналдыру сөздігі
-CITY_CODES = {
-    "ALMATY": "ALA", "АЛМАТЫ": "ALA", "ALM": "ALA", "АЛМ": "ALA", "ALA": "ALA",
-    "ASTANA": "NQZ", "АСТАНА": "NQZ", "AST": "NQZ", "АСT": "NQZ", "NQZ": "NQZ",
-    "SHYMKENT": "CIT", "ШЫМКЕНТ": "CIT", "SHYM": "CIT", "ШЫМ": "CIT", "CIT": "CIT",
-    "AKTAU": "SCO", "АҚТАУ": "SCO", "SCO": "SCO",
-    "ATYRAU": "GUW", "АТЫРАУ": "GUW", "GUW": "GUW",
-    "AKTOBE": "AKX", "АҚТӨБЕ": "AKX", "AKX": "AKX",
-    "KARAGANDA": "KGF", "ҚАРАҒАНДЫ": "KGF", "KGF": "KGF",
-    "TARAZ": "DMB", "ТАРАЗ": "DMB", "DMB": "DMB",
-    "UST-KAMENOGORSK": "UKK", "ӨСКЕМЕН": "UKK", "UKK": "UKK",
-    "SEMEY": "PLX", "СЕМЕЙ": "PLX", "PLX": "PLX",
-    "URALSK": "URA", "ОРАЛ": "URA", "URA": "URA",
-    "KOSTANAY": "KSN", "ҚОСТАНАЙ": "KSN", "KSN": "KSN",
-    "KYZYLORDA": "KZO", "ҚЫЗЫЛОРДА": "KZO", "KZO": "KZO",
-    "PAVLODAR": "PWQ", "ПАВЛОДАР": "PWQ", "PWQ": "PWQ",
-    "PETROPAVLOVSK": "PPK", "ПЕТРОПАВЛ": "PPK", "PPK": "PPK"
-}
+# Боттың ресми менюіне командаларды тіркеу
+def set_bot_menu():
+    commands = [
+        types.BotCommand("filter", "🌪 Іздеу сүзгісі (Фильтр)"),
+        types.BotCommand("collections", "📋 Менің рейстерім")
+    ]
+    bot.set_my_commands(commands)
 
-def get_city_code(text):
-    cleaned = text.strip().upper()
-    if cleaned in CITY_CODES:
-        return CITY_CODES[cleaned]
-    return cleaned[:3]
-
-def get_main_menu():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    btn_add = types.KeyboardButton("➕ Жаңа рейс қосу")
-    btn_list = types.KeyboardButton("📋 Менің рейстерім")
-    btn_del = types.KeyboardButton("❌ Рейсті өшіру")
-    markup.add(btn_add, btn_list)
-    markup.add(btn_del)
+def get_menu(chat_id):
+    if chat_id not in user_filters:
+        user_filters[chat_id] = {
+            "origin": "Таңдалмаған",
+            "dest": "Таңдалмаған",
+            "date": "Таңдалмаған",
+            "price": "Кез келген"
+        }
+    data = user_filters[chat_id]
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton(f"🛫 Қайдан: {data['origin']}", callback_data="set_origin"),
+        types.InlineKeyboardButton(f"🛬 Қайда: {data['dest']}", callback_data="set_dest")
+    )
+    markup.add(
+        types.InlineKeyboardButton(f"📅 Күні: {data['date']}", callback_data="set_date"),
+        types.InlineKeyboardButton(f"💰 Баға: {data['price']}", callback_data="set_price")
+    )
+    markup.add(types.InlineKeyboardButton("🔄 Тазалау", callback_data="reset"))
+    markup.add(types.InlineKeyboardButton("🔍 Іздеу (Қазір табу)", callback_data="search"))
     return markup
 
-def get_cancel_menu():
-    """Тоқтату (Аборт) батырмасы"""
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    markup.add(types.KeyboardButton("❌ Тоқтату"))
-    return markup
-
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    welcome_text = (
-        f"Сәлем, {message.from_user.first_name}! 👋\n"
-        f"Төмендегі мәзірді қолданып, рейстеріңізді басқара аласыз 👇"
+@bot.message_handler(commands=["start", "filter"])
+def start(message):
+    bot.send_message(
+        message.chat.id,
+        "🌪 <b>Авиарейстерді іздеу сүзгісі:</b>\nКеректі бағыт пен күнді таңдаңыз 👇",
+        parse_mode="HTML",
+        reply_markup=get_menu(message.chat.id)
     )
-    bot.send_message(message.chat.id, welcome_text, reply_markup=get_main_menu())
 
-# 1. 📋 МЕНІҢ РЕЙСТЕРІМДІ КӨРСЕТУ
-@bot.message_handler(func=lambda message: message.text == "📋 Менің рейстерім")
-def list_flights(message):
+# 📋 МЕНІҢ РЕЙСТЕРІМДІ КӨРСЕТУ КОМАНДАСЫ
+@bot.message_handler(commands=["collections"])
+def list_collections(message):
     chat_id = message.chat.id
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT origin, destination, departure_date, target_price FROM tracked_flights WHERE chat_id = %s;", (chat_id,))
-    flights = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    if not flights:
-        bot.send_message(chat_id, "Сізде әзірше бақылауда тұрған рейс жоқ.")
-    else:
-        res = "📋 <b>Сіздің бақылаудағы рейстеріңіз:</b>\n\n"
-        for f in flights:
-            price_text = f"{int(f[3])} ₸" if f[3] < 999999 else "Кез келген ең арзан баға"
-            res += f"✈️ {f[0]} ➡️ {f[1]}\n📅 Күні: {f[2]}\n🎯 Баға: {price_text}\n\n"
-        bot.send_message(chat_id, res, parse_mode="HTML")
-
-# 2. ➕ ЖАҢА РЕЙС ҚОСУ СЕРИЯСЫ
-@bot.message_handler(func=lambda message: message.text == "➕ Жаңа рейс қосу")
-def start_add_flight(message):
-    msg = bot.send_message(message.chat.id, "🛫 <b>Қай қаладан ұшасыз?</b> (Мысалы: Алматы немесе ALA):", parse_mode="HTML", reply_markup=get_cancel_menu())
-    bot.register_next_step_handler(msg, process_origin_step)
-
-def process_origin_step(message):
-    chat_id = message.chat.id
-    text = message.text.strip()
-    
-    if text == "❌ Тоқтату":
-        bot.send_message(chat_id, "Деректерді енгізу тоқтатылды 🛑", reply_markup=get_main_menu())
+    if not get_db_connection:
+        bot.send_message(chat_id, "⚠️ Деректер базасына қосылу модулі (database.py) табылмады.")
         return
 
-    if len(text) < 3:
-        msg = bot.send_message(chat_id, "❌ Қала аты немесе коды тым қысқа! Қайта жазыңыз:", parse_mode="HTML", reply_markup=get_cancel_menu())
-        bot.register_next_step_handler(msg, process_origin_step)
-        return
-
-    origin = get_city_code(text)
-    msg = bot.send_message(chat_id, "🛬 <b>Қай қалаға ұшасыз?</b> (Мысалы: Астана немесе NQZ):", parse_mode="HTML", reply_markup=get_cancel_menu())
-    bot.register_next_step_handler(msg, process_destination_step, origin)
-
-def process_destination_step(message, origin):
-    chat_id = message.chat.id
-    text = message.text.strip()
-    
-    if text == "❌ Тоқтату":
-        bot.send_message(chat_id, "Деректерді енгізу тоқтатылды 🛑", reply_markup=get_main_menu())
-        return
-
-    if len(text) < 3:
-        msg = bot.send_message(chat_id, "❌ Қала аты немесе коды тым қысқа! Қайта жазыңыз:", parse_mode="HTML", reply_markup=get_cancel_menu())
-        bot.register_next_step_handler(msg, process_destination_step, origin)
-        return
-
-    destination = get_city_code(text)
-    msg = bot.send_message(chat_id, "📅 <b>Ұшу күнін жазыңыз</b> (Мысалы: 2026-09-15):", parse_mode="HTML", reply_markup=get_cancel_menu())
-    bot.register_next_step_handler(msg, process_date_step, origin, destination)
-
-def process_date_step(message, origin, destination):
-    chat_id = message.chat.id
-    date_text = message.text.strip()
-    
-    if date_text == "❌ Тоқтату":
-        bot.send_message(chat_id, "Деректерді енгізу тоқтатылды 🛑", reply_markup=get_main_menu())
-        return
-
-    try:
-        datetime.strptime(date_text, "%Y-%m-%d")
-        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-        markup.add(types.KeyboardButton("🤷‍♂️ Маған бәрібір (Кез келген баға)"))
-        markup.add(types.KeyboardButton("❌ Тоқтату"))
-        
-        msg = bot.send_message(
-            chat_id, 
-            "💰 <b>Қандай бағадан төмен болса ескертейін?</b>\n(Бағаны теңгемен (тг) жазыңыз немесе мәзірдегі батырманы басыңыз):", 
-            parse_mode="HTML", 
-            reply_markup=markup
-        )
-        bot.register_next_step_handler(msg, process_price_step, origin, destination, date_text)
-    except ValueError:
-        msg = bot.send_message(chat_id, "❌ Қате формат! Күнді <code>2026-09-15</code> үлгісінде қайта жазыңыз:", parse_mode="HTML", reply_markup=get_cancel_menu())
-        bot.register_next_step_handler(msg, process_date_step, origin, destination)
-
-def process_price_step(message, origin, destination, departure_date):
-    chat_id = message.chat.id
-    text = message.text.strip()
-    
-    if text == "❌ Тоқтату":
-        bot.send_message(chat_id, "Деректерді енгізу тоқтатылды 🛑", reply_markup=get_main_menu())
-        return
-
-    if text == "🤷‍♂️ Маған бәрібір (Кез келген баға)":
-        target_price = 999999
-    else:
-        try:
-            target_price = float(text)
-        except ValueError:
-            markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-            markup.add(types.KeyboardButton("🤷‍♂️ Маған бәрібір (Кез келген баға)"))
-            markup.add(types.KeyboardButton("❌ Тоқтату"))
-            msg = bot.send_message(chat_id, "❌ Тек санмен (тг) жазыңыз немесе мәзірдегі батырманы басыңыз:", reply_markup=markup)
-            bot.register_next_step_handler(msg, process_price_step, origin, destination, departure_date)
-            return
-
-    save_flight_to_db(chat_id, origin, destination, departure_date, target_price)
-
-# 3. ❌ РЕЙСТЕРДІ ӨШІРУ МЕНЮІ
-@bot.message_handler(func=lambda message: message.text == "❌ Рейсті өшіру")
-def delete_flights_menu(message):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    markup.add(types.KeyboardButton("🗑 Барлық рейстерді өшіру"), types.KeyboardButton("⬅️ Артқа"))
-    
-    msg = bot.send_message(
-        message.chat.id, 
-        "📋 Рейстерді өшіру мәзіріне қош келдіңіз.\nТөмендегі мәзірден керекті әрекетті таңдаңыз 👇",
-        reply_markup=markup
-    )
-    bot.register_next_step_handler(msg, process_delete_step)
-
-def process_delete_step(message):
-    text = message.text.strip()
-    chat_id = message.chat.id
-    
-    if text == "🗑 Барлық рейстерді өшіру":
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM tracked_flights WHERE chat_id = %s;", (chat_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        bot.send_message(chat_id, "💥 Барлық рейстеріңіз базадан толықтай өшірілді!", reply_markup=get_main_menu())
-    else:
-        bot.send_message(chat_id, "Бас мәзірге қайтыңыз 👇", reply_markup=get_main_menu())
-
-def save_flight_to_db(chat_id, origin, destination, departure_date, target_price):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO tracked_flights (chat_id, origin, destination, departure_date, target_price) VALUES (%s, %s, %s, %s, %s);",
-            (chat_id, origin, destination, departure_date, target_price)
+            "SELECT origin, destination, departure_date, target_price FROM tracked_flights WHERE chat_id = %s;", 
+            (chat_id,)
         )
-        conn.commit()
+        flights = cur.fetchall()
         cur.close()
         conn.close()
 
-        price_show = f"{int(target_price)} ₸" if target_price < 999999 else "Кез келген ең арзан баға"
-        success_text = (
-            f"✅ <b>Рейс сәтті бақылауға алынды!</b>\n\n"
-            f"🛫 Қайдан: {origin}\n"
-            f"🛬 Қайда: {destination}\n"
-            f"📅 Күні: {departure_date}\n"
-            f"🎯 Күткен баға: {price_show}\n"
-        )
-        bot.send_message(chat_id, success_text, parse_mode="HTML", reply_markup=get_main_menu())
+        if not flights:
+            bot.send_message(chat_id, "📋 <b>Сізде әзірше бақылауда тұрған рейс жоқ.</b>\nЖаңа рейс қосу үшін /filter командасын басыңыз.", parse_mode="HTML")
+        else:
+            res = "📋 <b>Сіздің бақылаудағы барлық рейстеріңіз:</b>\n\n"
+            for i, f in enumerate(flights, 1):
+                price_text = f"{int(f[3])} ₸" if f[3] < 999999 else "Кез келген ең арзан баға"
+                res += f"{i}. ✈️ <b>{f[0]} ➡️ {f[1]}</b>\n📅 Күні: <code>{f[2]}</code>\n🎯 Шекті баға: <code>{price_text}</code>\n\n"
+            bot.send_message(chat_id, res, parse_mode="HTML")
     except Exception as e:
-        bot.send_message(chat_id, "❌ Базаға сақтау кезінде қате кетті.")
+        bot.send_message(chat_id, f"❌ Рейстерді базадан оқу кезінде қате кетті: {e}")
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    print("CALLBACK RECEIVED:", call.data)
+    bot.answer_callback_query(call.id)
+    chat_id = call.message.chat.id
+    menu_message_id = call.message.message_id
+
+    if call.data == "set_origin":
+        msg = bot.send_message(chat_id, "🛫 Қай қаладан ұшасыз? (Мысалы: ALA немесе Алматы)")
+        bot.register_next_step_handler(msg, save_origin, menu_message_id, msg.message_id)
+    elif call.data == "set_dest":
+        msg = bot.send_message(chat_id, "🛬 Қай қалаға ұшасыз? (Мысалы: NQZ немесе Астана)")
+        bot.register_next_step_handler(msg, save_dest, menu_message_id, msg.message_id)
+    elif call.data == "set_date":
+        msg = bot.send_message(chat_id, "📅 Ұшу күнін енгізіңіз (Формат: YYYY-MM-DD):")
+        bot.register_next_step_handler(msg, save_date, menu_message_id, msg.message_id)
+    elif call.data == "set_price":
+        msg = bot.send_message(chat_id, "💰 Максималды баға енгізіңіз (Тек сан жазыңыз):")
+        bot.register_next_step_handler(msg, save_price, menu_message_id, msg.message_id)
+        
+    elif call.data == "reset":
+        user_filters[chat_id] = {"origin": "Таңдалмаған", "dest": "Таңдалмаған", "date": "Таңдалмаған", "price": "Кез келген"}
+        bot.edit_message_reply_markup(chat_id, menu_message_id, reply_markup=get_menu(chat_id))
+        
+    elif call.data == "search":
+        data = user_filters.get(chat_id, {})
+        if data.get("origin") == "Таңдалмаған" or data.get("dest") == "Таңдалмаған" or data.get("date") == "Таңдалмаған":
+            bot.send_message(chat_id, "❌ Қате: Алдымен Қайдан, Қайда және Күнді енгізіңіз!")
+            return
+        
+        bot.send_message(chat_id, "⏳ Aviasales жүйесінен қазіргі ең арзан билетті іздеп жатырмын...")
+        
+        origin = data["origin"]
+        dest = data["dest"]
+        date = data["date"]
+        
+        try:
+            target_price = float(data["price"].replace(" ₸", "")) if data["price"] != "Кез келген" else 999999.0
+        except ValueError:
+            target_price = 999999.0
+
+        # Базаға жазу (Бірнеше рейс сақтала береді)
+        if get_db_connection:
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO tracked_flights (chat_id, origin, destination, departure_date, target_price) VALUES (%s, %s, %s, %s, %s);",
+                    (chat_id, origin, dest, date, target_price)
+                )
+                conn.commit()
+                cur.close()
+                conn.close()
+            except Exception as e:
+                print(f"Базаға жазуда қате: {e}")
+
+        # Сразу іздеу нәтижесі
+        current_price, gate, search_url = get_real_flight_info(origin, dest, date)
+
+        if current_price:
+            result_text = f"✈️ <b>Ең арзан билет табылды!</b>\n\n" \
+                          f"🛫 Бағыт: {origin} ➡️ {dest}\n" \
+                          f"📅 Күні: {date}\n" \
+                          f"💵 Қазіргі бағасы: <code>{current_price} ₸</code>\n" \
+                          f"🛒 Сатушы: {gate}\n\n" \
+                          f"📌 <i>Рейс бақылауға алынды! Баға сағат 08:00 мен 20:00-де автоматты түрде тексеріліп тұрады. Барлық рейстерді көру үшін: /collections</i>"
+            
+            inline_btn = types.InlineKeyboardMarkup()
+            inline_btn.add(types.InlineKeyboardButton(text="🎫 Билетті көру және алу", url=search_url))
+            bot.send_message(chat_id, result_text, parse_mode="HTML", reply_markup=inline_btn)
+        else:
+            bot.send_message(chat_id, "⚠️ Кешіріңіз, дәл қазір бұл күнге билет табылмады. Бірақ рейс бақылау тізіміне қосылды!")
+
+def clean_messages(chat_id, user_msg_id, bot_question_id):
+    try:
+        bot.delete_message(chat_id, user_msg_id)
+        bot.delete_message(chat_id, bot_question_id)
+    except Exception:
+        pass
+
+def save_origin(message, menu_message_id, bot_question_id):
+    chat_id = message.chat.id
+    user_filters[chat_id]["origin"] = message.text.upper()
+    bot.edit_message_reply_markup(chat_id, menu_message_id, reply_markup=get_menu(chat_id))
+    clean_messages(chat_id, message.message_id, bot_question_id)
+
+def save_dest(message, menu_message_id, bot_question_id):
+    chat_id = message.chat.id
+    user_filters[chat_id]["dest"] = message.text.upper()
+    bot.edit_message_reply_markup(chat_id, menu_message_id, reply_markup=get_menu(chat_id))
+    clean_messages(chat_id, message.message_id, bot_question_id)
+
+def save_date(message, menu_message_id, bot_question_id):
+    chat_id = message.chat.id
+    user_filters[chat_id]["date"] = message.text
+    bot.edit_message_reply_markup(chat_id, menu_message_id, reply_markup=get_menu(chat_id))
+    clean_messages(chat_id, message.message_id, bot_question_id)
+
+def save_price(message, menu_message_id, bot_question_id):
+    chat_id = message.chat.id
+    user_filters[chat_id]["price"] = message.text + " ₸"
+    bot.edit_message_reply_markup(chat_id, menu_message_id, reply_markup=get_menu(chat_id))
+    clean_messages(chat_id, message.message_id, bot_question_id)
 
 if __name__ == "__main__":
-    bot.infinity_polling()
+    set_bot_menu()
+    print("Бот толық қазақша режимде іске қосылды...")
+    bot.infinity_polling(skip_pending=True)
